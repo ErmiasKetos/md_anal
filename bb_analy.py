@@ -1,5 +1,7 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 import streamlit as st
-import json, math, io, random
+import json, math, io, random, zipfile
 import statistics as stats
 from datetime import datetime
 import numpy as np
@@ -149,7 +151,7 @@ def compute_absorbance(file_bytes, chan_key="SC_Green", formula="log10_bg_over_s
         raise ValueError("Non-positive intensities.")
     if formula == "log10_bg_over_sample":
         A = math.log10(bg_mean / sm_mean)
-    elif formula == "absorbance_single":  # sample vs. reference baseline
+    elif formula == "absorbance_single":
         A = -math.log10(sm_mean / bg_mean)
     else:
         A = math.log10(bg_mean / sm_mean)
@@ -192,7 +194,7 @@ def fit_quadratic(xs, ys, weights=None):
     ss_tot = np.sum((ys - np.mean(ys))**2)
     ss_res = np.sum((ys - yhat)**2)
     R2 = 1 - (ss_res/ss_tot if ss_tot>0 else 0.0)
-    return float(beta[0]), float(beta[1]), float(beta[2]), float(R2)  # a,b,c,R2
+    return float(beta[0]), float(beta[1]), float(beta[2]), float(R2)
 
 def lod_loq(blank_As, slope):
     if slope == 0 or not blank_As: return float("nan"), float("nan"), 0.0
@@ -218,6 +220,140 @@ def plot_calibration(xs, ys, m=None, b=None, quad=None, title="Calibration", xla
     pdf = io.BytesIO(); fig.savefig(pdf, format="pdf", bbox_inches="tight"); pdf.seek(0)
     plt.close(fig); return png.getvalue(), pdf.getvalue()
 
+# Residuals, LOOCV, and session I/O
+def calc_residuals(xs, ys, model):
+    xs = np.asarray(xs, float); ys = np.asarray(ys, float)
+    if model.get("model") == "linear":
+        m = model["m"]; b = model["b"]
+        yhat = m*xs + b
+    else:
+        a,b2,c = model["a"], model["b"], model["c"]
+        yhat = a*xs**2 + b2*xs + c
+    resid = ys - yhat
+    return yhat, resid
+
+def loocv_metrics(xs, ys, model_type="linear"):
+    xs = np.asarray(xs, float); ys = np.asarray(ys, float)
+    n = len(xs)
+    if n < 3:
+        return {"n": n, "PRESS": float("nan"), "RMSE_LOO": float("nan"), "R2_LOO": float("nan")}
+    yhat_loo = np.zeros(n)
+    for i in range(n):
+        mask = np.ones(n, dtype=bool); mask[i] = False
+        xtr, ytr = xs[mask], ys[mask]
+        try:
+            if model_type == "linear":
+                m,b,_ = fit_linear(xtr, ytr)
+                yhat_loo[i] = m*xs[i] + b
+            else:
+                a,b2,c,_ = fit_quadratic(xtr, ytr)
+                yhat_loo[i] = a*xs[i]**2 + b2*xs[i] + c
+        except Exception:
+            yhat_loo[i] = np.nan
+    resid = ys - yhat_loo
+    press = float(np.nansum(resid**2))
+    rmse = float(np.sqrt(press / np.sum(~np.isnan(resid))))
+    ss_tot = float(np.nansum((ys - np.nanmean(ys))**2))
+    r2_loo = float(1 - (press/ss_tot if ss_tot>0 else np.nan))
+    return {"n": int(n), "PRESS": press, "RMSE_LOO": rmse, "R2_LOO": r2_loo}
+
+def plot_residuals(xs, ys, model, title="Residuals"):
+    yhat, resid = calc_residuals(xs, ys, model)
+    fig, ax = plt.subplots(figsize=(6,4))
+    ax.scatter(yhat, resid)
+    ax.axhline(0, linestyle="--")
+    ax.set_title(title)
+    ax.set_xlabel("Fitted y")
+    ax.set_ylabel("Residuals")
+    fig.tight_layout()
+    png = io.BytesIO(); fig.savefig(png, format="png", dpi=200, bbox_inches="tight"); png.seek(0)
+    pdf = io.BytesIO(); fig.savefig(pdf, format="pdf", bbox_inches="tight"); pdf.seek(0)
+    plt.close(fig); return png.getvalue(), pdf.getvalue()
+
+def export_session_zip(analyte, profile, cal_table=None, model=None, plots=None):
+    # Bundle current session into a ZIP: profile.json, calibration.csv, model.json, plots/*.png
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("profile.json", json.dumps(profile, indent=2))
+        manifest = {"analyte": analyte, "has_cal_table": cal_table is not None, "has_model": model is not None, "plots": list(plots.keys()) if plots else []}
+        z.writestr("manifest.json", json.dumps(manifest, indent=2))
+        if cal_table is not None:
+            z.writestr("calibration.csv", cal_table.to_csv(index=False))
+        if model is not None:
+            z.writestr("model.json", json.dumps(model, indent=2))
+        if plots:
+            for name, bytes_data in plots.items():
+                z.writestr(f"plots/{name}", bytes_data)
+    buf.seek(0)
+    return buf.getvalue()
+
+def import_session_zip(zip_bytes):
+    with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as z:
+        manifest = json.loads(z.read("manifest.json").decode("utf-8")) if "manifest.json" in z.namelist() else {}
+        profile = json.loads(z.read("profile.json").decode("utf-8")) if "profile.json" in z.namelist() else None
+        cal_table = None
+        if "calibration.csv" in z.namelist():
+            from io import StringIO
+            cal_table = pd.read_csv(StringIO(z.read("calibration.csv").decode("utf-8")))
+        model = json.loads(z.read("model.json").decode("utf-8")) if "model.json" in z.namelist() else None
+        plots = {}
+        for name in z.namelist():
+            if name.startswith("plots/") and name.lower().endswith(".png"):
+                plots[name.split("/",1)[1]] = z.read(name)
+    return {"manifest": manifest, "profile": profile, "cal_table": cal_table, "model": model, "plots": plots}
+
+
+# =========================
+# Fitting helpers: residuals, LOOCV, and zip export
+# =========================
+
+def residuals_linear(xs, ys, m, b):
+    xs = np.asarray(xs, float); ys = np.asarray(ys, float)
+    yhat = m*xs + b
+    return (ys - yhat).tolist(), yhat.tolist()
+
+def loocv_linear(xs, ys, weights=None):
+    xs = np.asarray(xs, float); ys = np.asarray(ys, float)
+    n = len(xs)
+    errs = []
+    for i in range(n):
+        mask = np.ones(n, bool); mask[i] = False
+        try:
+            m_i, b_i, _ = fit_linear(xs[mask], ys[mask], None if weights is None else np.asarray(weights)[mask])
+            y_pred = m_i*xs[i] + b_i
+            errs.append(float(ys[i] - y_pred))
+        except Exception:
+            errs.append(float("nan"))
+    # RMSE and MAE on finite errors
+    fe = np.array([e for e in errs if np.isfinite(e)])
+    rmse = float(np.sqrt(np.mean(fe**2))) if fe.size else float("nan")
+    mae = float(np.mean(np.abs(fe))) if fe.size else float("nan")
+    return {"errors": errs, "RMSE": rmse, "MAE": mae}
+
+def make_residual_plot(xs, res, title="Residuals vs Conc", xlabel="Conc (mg/L)"):
+    fig, ax = plt.subplots(figsize=(6,4))
+    ax.scatter(xs, res)
+    ax.axhline(0, linestyle="--")
+    ax.set_title(title); ax.set_xlabel(xlabel); ax.set_ylabel("Residual (A)")
+    fig.tight_layout()
+    buf = io.BytesIO(); fig.savefig(buf, format="png", dpi=200, bbox_inches="tight"); buf.seek(0); plt.close(fig)
+    return buf.getvalue()
+
+def export_project_zip(analyte, cal_df, fit_json, cal_png=None, cal_pdf=None, residual_png=None):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        if cal_df is not None:
+            z.writestr(f"{analyte}_calibration_table.csv", cal_df.to_csv(index=False))
+        if fit_json is not None:
+            z.writestr(f"{analyte}_model.json", json.dumps(fit_json, indent=2))
+        if cal_png is not None:
+            z.writestr(f"{analyte}_calibration.png", cal_png)
+        if cal_pdf is not None:
+            z.writestr(f"{analyte}_calibration.pdf", cal_pdf)
+        if residual_png is not None:
+            z.writestr(f"{analyte}_residuals.png", residual_png)
+    buf.seek(0)
+    return buf.getvalue()
 # =========================
 # Profiles (per-analyte)
 # =========================
@@ -227,7 +363,7 @@ DEFAULT_PROFILE = {
     "channel": "SC_Green",
     "absorbance_formula": "log10_bg_over_sample",
     "defaults": {"base_sample_mL": 40.0, "extra_constant_mL": 0.0, "include_all_loc_volumes": True},
-    "locs": {}  # e.g., "LOC1": {"role":"standard","stock_mgL":1000,"notes":""}
+    "locs": {}
 }
 
 def get_profile_store():
@@ -324,6 +460,27 @@ tabs = st.tabs(["Calibration Builder","Unknown Prediction","DOE Designer","JSON 
 
 with tabs[0]:
     st.subheader(f"Calibration Builder — {analyte}")
+    with st.expander("Import Project ZIP (optional)", expanded=False):
+        zup = st.file_uploader("Upload a project ZIP exported by this app", type=["zip"], key="proj_zip_up")
+        if zup:
+            try:
+                import zipfile, io, pandas as pd, json
+                zf = zipfile.ZipFile(io.BytesIO(zup.getvalue()))
+                # Try to read calibration table
+                cand = [n for n in zf.namelist() if n.endswith("_calibration_table.csv")]
+                if cand:
+                    df_imp = pd.read_csv(zf.open(cand[0]))
+                    st.session_state["cal_table"] = df_imp
+                    st.success("Calibration table restored from ZIP.")
+                # Try to read model
+                candm = [n for n in zf.namelist() if n.endswith("_model.json")]
+                if candm:
+                    model = json.load(zf.open(candm[0]))
+                    st.session_state["imported_model"] = model
+                    st.info("Model JSON found in ZIP (available under Unknown Prediction if you download & reuse).")
+            except Exception as e:
+                st.error(f"Failed to import project ZIP: {e}")
+    st.subheader(f"Calibration Builder — {analyte}")
     st.write("Upload device JSON files (Background + Sample in the same file). Optionally infer concentration from LOC dosing.")
     files = st.file_uploader("Drop multiple JSON files", type=["json"], accept_multiple_files=True)
 
@@ -406,19 +563,16 @@ with tabs[0]:
                 ys = sub["A"].astype(float).tolist()
                 sds = None
                 blanks = sub[sub["conc_mgL"]==0]["A"].astype(float).tolist()
-            # Sanity
             xy = [(x,y,(sds[i] if sds is not None and i<len(sds) else None)) for i,(x,y) in enumerate(zip(xs,ys)) if np.isfinite(x) and np.isfinite(y)]
             if len(xy)<2: st.warning("Need ≥2 points to fit."); return None, None, None
             xs=[x for x,_,_ in xy]; ys=[y for _,y,_ in xy]; sds=[sd for _,_,sd in xy] if use_means else None
             if len(set([round(x,6) for x in xs]))<2: st.warning("Need ≥2 unique levels."); return None,None,None
-            # Weights
             weights=None
             if weighting_scheme=="1/max(C,1)":
                 weights=[1.0/max(x,1.0) for x in xs]
             elif weighting_scheme=="Variance-weighted (1/SD^2)" and use_means:
                 eps=1e-6; nz=[sd for sd in sds if sd and sd>0]; base=np.median(nz) if nz else 0.01
                 denom=[(sd if (sd and sd>0) else base)**2 + eps for sd in sds]; weights=[1.0/d for d in denom]
-            # Fit
             if fit_model=="Quadratic":
                 try:
                     a,b,c,R2 = fit_quadratic(xs, ys, weights=weights)
@@ -441,11 +595,66 @@ with tabs[0]:
                 "weighting": weighting_scheme,
                 "used_replicate_means": use_means
             })
-            return res, png, pdf
+            return (res, png, pdf, xs, ys)
+
 
         st.markdown("### Model Fit")
         fit_res, png, pdf = fit(sub, grp, f"{analyte} calibration")
         if fit_res:
+            # Residuals (linear only)
+            residual_png = None
+            if fit_res.get("model") == "linear":
+                # Rebuild x/y used in the fit for residual calc
+                use_means_now = fit_res.get("used_replicate_means", False)
+                if use_means_now:
+                    xs = grp["conc_mgL"].astype(float).tolist()
+                    ys = grp["A_mean"].astype(float).tolist()
+                    sds = grp["A_sd"].astype(float).tolist()
+                else:
+                    xs = sub["conc_mgL"].astype(float).tolist()
+                    ys = sub["A"].astype(float).tolist()
+                    sds = None
+                # weights for LOOCV if variance-weighted selected
+                weights = None
+                if weighting_scheme=="Variance-weighted (1/SD^2)" and use_means_now:
+                    eps=1e-6; nz=[sd for sd in sds if sd and sd>0]; base=np.median(nz) if nz else 0.01
+                    denom=[(sd if (sd and sd>0) else base)**2 + eps for sd in sds]
+                    weights=[1.0/d for d in denom]
+                m = fit_res["m"]; b = fit_res["b"]
+                resids, yhat = residuals_linear(xs, ys, m, b)
+                residual_png = make_residual_plot(xs, resids, title=f"{analyte} residuals")
+                st.markdown("#### Residual Analysis")
+                st.dataframe(pd.DataFrame({"Conc_mgL": xs, "A_obs": ys, "A_fit": yhat, "Residual": resids}))
+                st.image(residual_png, caption="Residuals vs Conc", use_column_width=True)
+
+                # LOOCV
+                cv = loocv_linear(xs, ys, weights=weights)
+                st.markdown("#### Leave-One-Out Cross-Validation (Linear)")
+                st.json(cv, expanded=False)
+
+            st.json(fit_res, expanded=False)
+            if png:
+                st.download_button("Download calibration plot (PNG)", data=png, file_name=f"{analyte}_calibration.png", mime="image/png")
+                st.download_button("Download calibration plot (PDF)", data=pdf, file_name=f"{analyte}_calibration.pdf", mime="application/pdf")
+
+            # Model export
+            model = {
+                "analyte": analyte,
+                "created_at": datetime.utcnow().isoformat()+"Z",
+                "channel": prof["channel"],
+                "absorbance_formula": prof["absorbance_formula"],
+                "fit": fit_res,
+                "range_hint_mgL": [0.0, 25.0]
+            }
+            st.download_button("Download model JSON", data=json.dumps(model, indent=2), file_name=f"{analyte}_model.json", mime="application/json")
+
+            # Project ZIP export
+            proj = export_project_zip(analyte, df, model, cal_png=png, cal_pdf=pdf, residual_png=residual_png)
+            st.download_button("Download Project ZIP", data=proj, file_name=f"{analyte}_project.zip", mime="application/zip")
+
+        out = fit(sub, grp, f"{analyte} calibration")
+        if out:
+            fit_res, png, pdf, xs_fit, ys_fit = out
             st.json(fit_res, expanded=False)
             if png:
                 st.download_button("Download calibration plot (PNG)", data=png, file_name=f"{analyte}_calibration.png", mime="image/png")
@@ -460,6 +669,25 @@ with tabs[0]:
                 "range_hint_mgL": [0.0, 25.0]
             }
             st.download_button("Download model JSON", data=json.dumps(model, indent=2), file_name=f"{analyte}_model.json", mime="application/json")
+
+            # Residuals, LOOCV, and session ZIP
+            if fit_res["model"]=="linear":
+                model_for_resid = {"model":"linear","m":fit_res["m"],"b":fit_res["b"]}
+                loocv = loocv_metrics(xs_fit, ys_fit, model_type="linear")
+            else:
+                model_for_resid = {"model":"quadratic","a":fit_res["a"],"b":fit_res["b"],"c":fit_res["c"]}
+                loocv = loocv_metrics(xs_fit, ys_fit, model_type="quadratic")
+            png_res, pdf_res = plot_residuals(xs_fit, ys_fit, model_for_resid, title=f"{analyte} residuals")
+            st.download_button("Download residuals plot (PNG)", data=png_res, file_name=f"{analyte}_residuals.png", mime="image/png")
+            st.download_button("Download residuals plot (PDF)", data=pdf_res, file_name=f"{analyte}_residuals.pdf", mime="application/pdf")
+            st.markdown("**LOOCV diagnostics**")
+            st.json(loocv, expanded=False)
+
+            plots = {}
+            if png: plots[f"{analyte}_calibration.png"] = png
+            if png_res: plots[f"{analyte}_residuals.png"] = png_res
+            zip_bytes = export_session_zip(analyte, prof, cal_table=df, model=model, plots=plots)
+            st.download_button("Export Session ZIP", data=zip_bytes, file_name=f"{analyte}_session.zip", mime="application/zip")
 
 # =========================
 # Unknown Prediction
@@ -482,18 +710,14 @@ with tabs[1]:
                 m=model["fit"]["m"]; b=model["fit"]["b"]
                 C = predict_conc_linear(A, m, b)
             else:
-                # For quadratic y = a x^2 + b x + c; solve for x via nearest positive root to range
                 a=model["fit"]["a"]; bq=model["fit"]["b"]; c=model["fit"]["c"]
-                # a x^2 + b x + (c - A) = 0
                 A0 = c - A
                 disc = bq*bq - 4*a*A0
                 if disc < 0: C = float("nan")
                 else:
                     r1 = (-bq + math.sqrt(disc))/(2*a) if a!=0 else float("nan")
                     r2 = (-bq - math.sqrt(disc))/(2*a) if a!=0 else float("nan")
-                    # choose root closest to range_hint mid
-                    lo,hi = model.get("range_hint_mgL",[0,25])
-                    mid = (lo+hi)/2.0
+                    lo,hi = model.get("range_hint_mgL",[0,25]); mid=(lo+hi)/2.0
                     candidates = [r for r in [r1,r2] if np.isfinite(r)]
                     C = min(candidates, key=lambda r: abs(r-mid)) if candidates else float("nan")
             st.write({"file": f.name, "A": A, "conc_mgL": C, **diag})
@@ -503,7 +727,6 @@ with tabs[1]:
 # =========================
 
 def full_factorial(levels_dict):
-    # levels_dict: {"factor": [low, high]} or 3+ levels
     keys = list(levels_dict.keys())
     grids = [[]]
     for k in keys:
@@ -520,12 +743,8 @@ def full_factorial(levels_dict):
     return pd.DataFrame(rows)
 
 def central_composite(factors, center_points=4, alpha="orthogonal"):
-    # Simple CCD around low/high coded -1/+1
-    # factors: {"factor": (low, high)}
     keys = list(factors.keys())
-    # factorial corner points
     base = full_factorial({k: [-1, 1] for k in keys})
-    # star points
     if alpha == "orthogonal":
         a = (len(keys))**0.5
     else:
@@ -535,10 +754,8 @@ def central_composite(factors, center_points=4, alpha="orthogonal"):
         row_pos = {kk: 0 for kk in keys}; row_pos[k] = a; stars.append(row_pos.copy())
         row_neg = {kk: 0 for kk in keys}; row_neg[k] = -a; stars.append(row_neg.copy())
     star_df = pd.DataFrame(stars)
-    # center points
     centers = pd.DataFrame([{kk: 0 for kk in keys} for _ in range(center_points)])
     coded = pd.concat([base.assign(design="factorial"), star_df.assign(design="star"), centers.assign(design="center")], ignore_index=True).reset_index(drop=True)
-    # decode
     def decode(k, x):
         lo, hi = factors[k]
         return ( (x + 1)/2 )*(hi - lo) + lo
@@ -551,9 +768,66 @@ def central_composite(factors, center_points=4, alpha="orthogonal"):
 with tabs[2]:
     st.subheader("DOE Designer")
     st.write("Build calibration plans and method-development experiments.")
-    design = st.selectbox("Design type", ["Calibration levels (randomized)","2-level full factorial (screening)","Central Composite (CCD)"], index=0)
+    design = st.selectbox("Design type", ["Calibration (auto-generator)","Calibration (manual levels)","2-level full factorial (screening)","Central Composite (CCD)"], index=0)
+
+    # Templates by analyte (editable starter sets)
+    DOE_TEMPLATES = {
+        "Iron": {
+            "screening": "pH: 3, 6\nBuffer_mM: 10, 50\nPhenanthroline_mM: 0.5, 2.0\nReactionTime_min: 1, 10\nTemperature_C: 20, 35",
+            "ccd": "pH: 3, 6\nBuffer_mM: 10, 50\nPhenanthroline_mM: 0.5, 2.0\nReactionTime_min: 1, 10"
+        },
+        "Phosphate": {
+            "screening": "pH: 1, 2\nMolybdate_mM: 5, 20\nAscorbicAcid_mM: 10, 50\nReactionTime_min: 5, 15\nTemperature_C: 20, 35",
+            "ccd": "pH: 1, 2\nMolybdate_mM: 5, 20\nAscorbicAcid_mM: 10, 50\nReactionTime_min: 5, 15"
+        },
+        "Ammonia": {
+            "screening": "pH: 10, 11.5\nNessler_mM: 1, 5\nReactionTime_min: 5, 20\nTemperature_C: 20, 35",
+            "ccd": "pH: 10, 11.5\nNessler_mM: 1, 5\nReactionTime_min: 5, 20"
+        }
+    }
+    templ = DOE_TEMPLATES.get(analyte, DOE_TEMPLATES.get("Iron"))
+
     reps = st.number_input("Replicates per condition", 1, 10, 2, 1)
-    if design == "Calibration levels (randomized)":
+    # Per-analyte DOE factor presets (editable by user)
+    presets = {
+        "Iron": "pH: 3, 6\nBuffer_mM: 10, 50\nReagent_uL: 200, 1500\nTime_min: 1, 10\nTemp_C: 20, 35",
+        "Phosphate": "pH: 5, 9\nMolybdate_mM: 5, 25\nAscorbic_mM: 5, 20\nTime_min: 5, 20\nTemp_C: 20, 35",
+        "Ammonia": "pH: 10, 11.5\nNessler_uL: 100, 800\nTime_min: 2, 15\nTemp_C: 20, 35",
+    }
+    st.markdown("**Preset factors (optional):**")
+    preset_txt = presets.get(analyte, presets["Iron"])
+
+    if design == "Calibration (auto-generator)":
+        st.markdown("Generate calibration levels from range and scheme.")
+        colA, colB, colC = st.columns(3)
+        with colA:
+            cmin = st.number_input("Min conc (mg/L)", 0.0, 1e9, 0.0, 0.01)
+        with colB:
+            cmax = st.number_input("Max conc (mg/L)", 0.0, 1e9, 25.0, 0.01)
+        with colC:
+            npts = st.number_input("# nonzero points", 2, 15, 6, 1)
+        scheme = st.selectbox("Spacing", ["Linear", "Logarithmic", "ICH template"], index=0)
+        include_blank = st.checkbox("Include blank (0 mg/L)", value=True)
+        if st.button("Build auto plan"):
+            levels = []
+            if scheme == "Linear":
+                levels = list(np.linspace(cmin, cmax, npts))
+            elif scheme == "Logarithmic":
+                low = max(cmin, 1e-6)
+                levels = list(np.logspace(np.log10(low), np.log10(max(cmax, low*10)), npts))
+            else:  # ICH template: ~5 nonzero + blank at 20,40,60,80,100% of range
+                lo, hi = min(cmin, cmax), max(cmin, cmax)
+                perc = [0.2, 0.4, 0.6, 0.8, 1.0]
+                levels = [lo + p*(hi-lo) for p in perc]
+            levels = [round(x, 6) for x in levels if x >= 0]
+            seq = ([] if not include_blank else [0.0]) + levels
+            seq = seq * reps
+            random.shuffle(seq)
+            rows = [{"order": i+1, "analyte": analyte, "target_mgL": c, "json_path": "", "notes": ""} for i, c in enumerate(seq)]
+            plan = pd.DataFrame(rows); st.dataframe(plan)
+            st.download_button("Download DOE CSV", data=plan.to_csv(index=False), file_name=f"{analyte}_calibration_auto_plan.csv", mime="text/csv")
+
+    if design == "Calibration (manual levels)":
         levels_str = st.text_input("Levels (mg/L, comma-separated)", "0, 1, 2, 5, 10, 15, 20, 25")
         if st.button("Build plan"):
             try:
@@ -567,7 +841,10 @@ with tabs[2]:
             st.download_button("Download DOE CSV", data=plan.to_csv(index=False), file_name=f"{analyte}_calibration_plan.csv", mime="text/csv")
     elif design == "2-level full factorial (screening)":
         st.markdown("Enter factors with low/high values (e.g., pH, Buffer_mM, Reagent1_uL, ReactionTime_min, Temperature_C, Wavelength_nm).")
-        raw = st.text_area("Factors (one per line as name: low, high)", "pH: 3, 6\nBuffer_mM: 10, 50\nReagent1_uL: 100, 1000\nReactionTime_min: 1, 10\nTemperature_C: 20, 35")
+        st.caption("Preset for this analyte (editable):")
+        preset_area = st.text_area("Preset factors", preset_txt, key="preset_factorial")
+
+        raw = st.text_area("Factors (one per line as name: low, high)", templ["screening"] if templ else "pH: 3, 6\nBuffer_mM: 10, 50\nReagent1_uL: 100, 1000\nReactionTime_min: 1, 10\nTemperature_C: 20, 35")
         if st.button("Build factorial"):
             factors = {}
             for line in raw.splitlines():
@@ -592,7 +869,10 @@ with tabs[2]:
                 st.download_button("Download DOE CSV", data=plan.to_csv(index=False), file_name=f"{analyte}_factorial_plan.csv", mime="text/csv")
     else:
         st.markdown("Enter factors with low/high values for CCD.")
-        raw = st.text_area("Factors (one per line as name: low, high)", "pH: 3, 6\nBuffer_mM: 10, 50\nReagent1_uL: 100, 1000\nReactionTime_min: 1, 10")
+        st.caption("Preset for this analyte (editable):")
+        preset_area_ccd = st.text_area("Preset factors", preset_txt, key="preset_ccd")
+
+        raw = st.text_area("Factors (one per line as name: low, high)", templ["ccd"] if templ else "pH: 3, 6\nBuffer_mM: 10, 50\nReagent1_uL: 100, 1000\nReactionTime_min: 1, 10")
         center_pts = st.number_input("Center points", 0, 20, 4, 1)
         if st.button("Build CCD"):
             factors = {}
@@ -639,7 +919,7 @@ with tabs[3]:
             st.error(str(e))
 
 # =========================
-# About / Disclaimer
+# About / Disclaimer + Session Import
 # =========================
 
 with tabs[4]:
@@ -655,9 +935,25 @@ A generalized, multi‑analyte app for **method development** and **analysis** o
 - Replicate-aware calibration with **weighting** (OLS, 1/max(C,1), **variance‑weighted 1/SD²**).
 - Models: Linear or Quadratic; **PNG/PDF** plot export; model JSON export.
 - DOE generator: **Calibration set**, **2‑level factorial** (screening), and **Central Composite** (CCD) designs.
+- **Residuals** plot and **LOOCV** diagnostics for calibration robustness.
+- **Session ZIP** export/import for traceability and collaboration.
 
 ### Disclaimer on Analyte Stability
 For redox‑active or labile species (e.g., Fe²⁺/Fe³⁺), speciation can change quickly after sampling due to oxidation/reduction, hydrolysis, and precipitation. Delayed analysis without proper preservation may not reflect in‑situ speciation. Acid preservation stabilizes **total analyte** but not speciation. For speciation work, **preserve or complex immediately** at the point of sampling and minimize holding time.
 
 ---
 """)
+    st.markdown("### Session Import")
+    zip_up = st.file_uploader("Load Session ZIP", type=["zip"], key="sess_zip")
+    if zip_up:
+        try:
+            loaded = import_session_zip(zip_up.getvalue())
+            if loaded.get("profile"):
+                set_profile(analyte, loaded["profile"])
+            if loaded.get("cal_table") is not None:
+                st.session_state["cal_table"] = loaded["cal_table"]
+            if loaded.get("model") is not None:
+                st.session_state["loaded_model"] = loaded["model"]
+            st.success("Session loaded into memory. Switch to other tabs to view.")
+        except Exception as e:
+            st.error(f"Failed to import session: {e}")
