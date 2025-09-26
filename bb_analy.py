@@ -287,10 +287,40 @@ def fit_quadratic(xs, ys, weights=None):
     R2 = 1 - (ss_res/ss_tot if ss_tot>0 else 0.0)
     return float(beta[0]), float(beta[1]), float(beta[2]), float(R2)
 
-def lod_loq(blank_As, slope):
-    if slope == 0 or not blank_As: return float("nan"), float("nan"), 0.0
-    sd = float(np.std(blank_As, ddof=0))
-    return 3.3*sd/abs(slope), 10.0*sd/abs(slope), sd
+def lod_loq(xs, ys, slope, intercept, blank_As=None):
+    """Compute LOD/LOQ using calibration residuals (ICH Q2 (R1))."""
+    xs = np.asarray(xs, dtype=float)
+    ys = np.asarray(ys, dtype=float)
+    slope = float(slope)
+    intercept = float(intercept)
+
+    # Default outputs
+    lod = float("nan")
+    loq = float("nan")
+    sd_blank = float("nan")
+    sd_response = float("nan")
+
+    if blank_As:
+        blanks = np.asarray(blank_As, dtype=float)
+        if blanks.size:
+            ddof = 1 if blanks.size > 1 else 0
+            sd_blank = float(np.std(blanks, ddof=ddof))
+
+    if slope == 0 or not np.isfinite(slope):
+        return lod, loq, sd_blank, sd_response
+
+    if xs.size >= 3:
+        yhat = slope * xs + intercept
+        resid = ys - yhat
+        dof = xs.size - 2
+        if dof > 0:
+            ss_res = np.sum(resid**2)
+            sd_response = math.sqrt(ss_res / dof)
+            if sd_response >= 0:
+                lod = 3.3 * sd_response / abs(slope)
+                loq = 10.0 * sd_response / abs(slope)
+
+    return lod, loq, sd_blank, sd_response
 
 def predict_conc_linear(A, m, b): return (A - b)/m
 
@@ -971,8 +1001,17 @@ with tabs[0]:
                 try:
                     m,b,R2 = fit_linear(xs, ys, weights=weights)
                     png,pdf = plot_calibration(xs,ys,m=m,b=b,title=title)
-                    lod,loq,sd_blank = lod_loq(blanks, m)
-                    res = {"model":"linear","m":m,"b":b,"R2":R2,"LoD":lod,"LoQ":loq,"blank_sd_A":sd_blank}
+                    lod,loq,sd_blank,sd_resp = lod_loq(xs, ys, m, b, blank_As=blanks)
+                    res = {
+                        "model":"linear",
+                        "m":m,
+                        "b":b,
+                        "R2":R2,
+                        "LoD":lod,
+                        "LoQ":loq,
+                        "blank_sd_A":sd_blank,
+                        "response_sd_A": sd_resp
+                    }
                 except Exception as e:
                     st.error(f"❌ Linear fit failed: {e}")
                     return None,None,None
@@ -1018,6 +1057,10 @@ with tabs[0]:
                 if fit_res.get("LoD") is not None:
                     st.metric("LoD (mg/L)", f"{fit_res.get('LoD', 0):.4f}")
                     st.metric("LoQ (mg/L)", f"{fit_res.get('LoQ', 0):.4f}")
+                    if np.isfinite(fit_res.get("response_sd_A", float("nan"))):
+                        st.metric("σ_response (A)", f"{fit_res.get('response_sd_A', 0):.6f}")
+                    if np.isfinite(fit_res.get("blank_sd_A", float("nan"))):
+                        st.metric("σ_blank (A)", f"{fit_res.get('blank_sd_A', 0):.6f}")
                 else:
                     st.info("N/A for quadratic models")
             
